@@ -28,7 +28,7 @@ This project implements a real-time hand gesture recognition system using CNN an
 
 ## Results
 
-(Add screenshot here later)
+![Output](pynq.jpg)
 
 ## Future Improvements
 
