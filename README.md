@@ -77,7 +77,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 ## Demo
-![Pynw](assets/PYNQZ2_Output.mp4)
+![Pynq_Output](assets/PYNQZ2_Output.mp4)
 
 ## Future Improvements
 
