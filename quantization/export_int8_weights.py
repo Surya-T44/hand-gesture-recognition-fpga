@@ -1,0 +1,55 @@
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+import tensorflow_model_optimization as tfmot
+
+# --- SETTINGS ---
+MODEL_PATH = '/home/surya/Desktop/4/model/Xgesture_cnn_dw_bn.h5'
+EXPORT_DIR = '/home/surya/Desktop/4/model/exported_weights'
+IMG_SIZE = (64, 64)
+N_CLASSES = 6
+
+# 1. Load the trained model
+model = keras.models.load_model(MODEL_PATH)
+
+# 2. Post-Training Quantization (to int8)
+quantize_model = tfmot.quantization.keras.quantize_model
+q_aware_model = quantize_model(model)
+q_aware_model.compile(optimizer='adam',
+                      loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+print("Model structure quantized to int8 (PTQ-style, weights still float for export step).")
+
+# 3. Export weights to C header files for HLS
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+def save_weights_to_header(model, export_dir):
+    idx = 0
+    for layer in model.layers:
+        weights = layer.get_weights()
+        if not weights: continue
+        for w in weights:
+            arr = np.round(w * 127).astype(np.int8)  # Scale and quantize to int8
+            flat = arr.flatten()
+            fname = f"{layer.name}_w{idx}.h"
+            with open(os.path.join(export_dir, fname), 'w') as f:
+                f.write(f"// Quantized int8 weights for {layer.name}\n")
+                f.write(f"static const int8_t {layer.name}_w{idx}[] = {{\n    ")
+                f.write(', '.join(map(str, flat)))
+                f.write('\n};\n')
+            print(f"Saved {fname} ({arr.shape})")
+            idx += 1
+
+save_weights_to_header(model, EXPORT_DIR)
+print(f"✅ Exported quantized weights to {EXPORT_DIR}")
+
+# 4. Export a quantized TFLite model (optional, for test/sanity check)
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+tflite_quant_model = converter.convert()
+with open(os.path.join(EXPORT_DIR, '4_int8.tflite'), 'wb') as f:
+    f.write(tflite_quant_model)
+print("✅ Exported quantized TFLite model.")
+
+print("Done. You are ready for HLS.")
