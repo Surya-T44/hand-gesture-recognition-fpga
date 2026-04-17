@@ -1,6 +1,6 @@
-# 🚀 Hardware-Efficient Hand Gesture Recognition on FPGA (HGR-Lite)
+# Hardware-Efficient Hand Gesture Recognition on FPGA (HGR-Lite)
 
-## 📌 Overview
+## Overview
 
 This project implements a real-time hand gesture recognition system on FPGA using a custom lightweight CNN.
 
@@ -13,7 +13,7 @@ It covers the full pipeline:
 
 ---
 
-## 🧠 Key Features
+## Key Features
 
 * Depthwise CNN (MobileNet-style)
 * INT8 quantized inference
@@ -24,13 +24,13 @@ It covers the full pipeline:
 
 ---
 
-## 🏗️ System Pipeline
+## System Pipeline
 
 Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 
-## 🧩 Model Details
+## Model Details
 
 * Input: 64×64 RGB
 * 4 Depthwise Conv Blocks
@@ -40,7 +40,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 
-## ⚙️ Hardware Implementation
+## Hardware Implementation
 
 * Vitis HLS (C++)
 * BRAM for feature maps
@@ -49,7 +49,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 
-## 🔁 Deployment Flow
+## Deployment Flow
 
 1. Train model in TensorFlow
 2. Quantize weights to INT8
@@ -59,7 +59,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 
-## 🎥 Features
+## Features
 
 * Live gesture detection
 * ROI selection (center / skin / edges)
@@ -68,7 +68,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 * Python, TensorFlow, OpenCV
 * Vitis HLS
@@ -77,7 +77,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
 ---
 
-## 🚧 Future Improvements
+## Future Improvements
 
 * Better accuracy
 * Faster inference (pipelining)
