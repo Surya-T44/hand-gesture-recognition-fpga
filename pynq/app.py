@@ -1,0 +1,398 @@
+# ================================================================
+# FPGA Gesture Debug App — visualize preprocess & output
+# Overlay: b4.bit  |  DMA: chunked 32-bit words (4095-word chunks)
+# - 4-up view: raw crop | preprocessed (what CNN sees) | output | probs
+# - Switch color modes: /set_mode/<gray3|clahe3|rgb|bgr>
+# - Switch ROI modes:   /set_roi/<center|skin|edges>
+# - Remap label order:  /set_map/<csv>   e.g., /set_map/0,1,2,3,4,5
+# - Save exact 64x64 tensor: /save_64x64
+# ================================================================
+from pynq import Overlay, allocate
+import cv2, numpy as np, time, os, datetime
+from flask import Flask, Response, redirect
+
+# --------------- Config ----------------
+BIT = "/home/xilinx/jupyter_notebooks/fifo/b41.bit"
+
+IMG_H, IMG_W, N_CLASSES = 64, 64, 6
+NUM_PIX = IMG_H * IMG_W * 3
+
+# Display names (your UI). Order here is cosmetic; mapping below can remap.
+GESTURE_LABELS = ["one", "victory", "three", "fist", "palm", "unknown"]
+
+# Start with training-like settings:
+PREPROCESS_MODE = "rgb"         # rgb | bgr | gray3 | clahe3
+ROI_MODE        = "center"      # center | skin | edges
+
+# Confidence threshold → UNKNOWN
+CONF_THRESH = 0.55
+
+# Background guard on preprocessed image (unknown if too dark/flat)
+BG_MEAN_THR = 12.0
+BG_STD_THR  = 7.0
+
+# Model-index -> display-index mapping (identity to start).
+# If you find model index 2 is actually your "palm", set INDEX_MAP[2] = display_idx_of_palm.
+INDEX_MAP = [0,1,2,3,4,5]
+
+SNAP_DIR = "/home/xilinx/jupyter_notebooks/fifo/snaps"
+os.makedirs(SNAP_DIR, exist_ok=True)
+
+# --------------- Overlay / DMA ----------------
+overlay = Overlay(BIT)
+dma = overlay.axi_dma_0
+cnn = overlay.cnn_accel_axis_1
+print("[INFO] Overlay loaded and CNN ready.")
+
+# Buffers: input words (12,288 u32; LSB used), output words (6 u32; LSB int8)
+in_words  = allocate(shape=(NUM_PIX,),   dtype=np.uint32)
+out_words = allocate(shape=(N_CLASSES,), dtype=np.uint32)
+
+# chunking to respect ~16,383 B
+MAX_BYTES = 16383
+WORDS_PER_CHUNK = MAX_BYTES // 4  # 4095
+
+# low-level DMA reset
+MM2S_DMACR = 0x00; MM2S_DMASR = 0x04
+S2MM_DMACR = 0x30; S2MM_DMASR = 0x34
+def reset_dma_hard():
+    sc = dma.sendchannel._mmio
+    rc = dma.recvchannel._mmio
+    sc.write(MM2S_DMACR, 0x4); rc.write(S2MM_DMACR, 0x4)
+    time.sleep(0.002)
+    sc.write(MM2S_DMACR, 0x0); rc.write(S2MM_DMACR, 0x0)
+    sc.write(MM2S_DMASR, 0xFFFFFFFF); rc.write(S2MM_DMASR, 0xFFFFFFFF)
+    sc.write(MM2S_DMACR, 0x1); rc.write(S2MM_DMACR, 0x1)
+    time.sleep(0.001)
+
+reset_dma_hard()
+print("[INFO] DMA hard-reset at startup")
+
+# --------------- Camera ----------------
+camera = None
+for i in range(3):
+    cap = cv2.VideoCapture(i)
+    if cap.isOpened():
+        camera = cap
+        print(f"[INFO] Using /dev/video{i}")
+        break
+if camera is None:
+    raise RuntimeError("No camera found")
+
+last_pre_rgb = None   # exact 64x64 RGB tensor we send to CNN (for /save_64x64)
+
+# --------------- ROI helpers ----------------
+def center_crop_to_square(img):
+    h, w = img.shape[:2]
+    s = min(h, w); y0 = (h - s)//2; x0 = (w - s)//2
+    return img[y0:y0+s, x0:x0+s]
+
+def roi_skin(img_bgr):
+    """Skin mask (HSV + YCrCb), largest contour, square pad; fallback to center."""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+
+    # HSV ranges for various skin tones (very generic)
+    mask1 = cv2.inRange(hsv,  (0, 30, 60),  (20, 180, 255))
+    mask2 = cv2.inRange(hsv,  (160, 30, 60),(180, 180, 255))
+
+    # YCrCb (Cr/ Cb) bounds
+    cr = ycrcb[:,:,1]; cb = ycrcb[:,:,2]
+    ycbcr_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+
+    mask = cv2.bitwise_or(mask1, mask2)
+    mask = cv2.bitwise_or(mask, ycbcr_mask)
+
+    mask = cv2.GaussianBlur(mask, (5,5), 0)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=2)
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return center_crop_to_square(img_bgr)
+    c = max(cnts, key=cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(c)
+    area = w*h
+    if area < 0.01 * img_bgr.shape[0] * img_bgr.shape[1]:
+        return center_crop_to_square(img_bgr)
+
+    # square pad box
+    side = max(w,h)
+    cx, cy = x + w//2, y + h//2
+    x0, y0 = max(0, cx - side//2), max(0, cy - side//2)
+    x1 = min(img_bgr.shape[1], x0 + side)
+    y1 = min(img_bgr.shape[0], y0 + side)
+    roi = img_bgr[y0:y1, x0:x1]
+    return roi if roi.size else center_crop_to_square(img_bgr)
+
+def roi_edges(img_bgr):
+    """Edge-based largest contour, fallback to center."""
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (5,5), 0)
+    edges = cv2.Canny(g, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3,3), np.uint8), 1)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return center_crop_to_square(img_bgr)
+    c = max(cnts, key=cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(c)
+    if w*h < 0.01 * img_bgr.shape[0]*img_bgr.shape[1]:
+        return center_crop_to_square(img_bgr)
+    side = max(w,h)
+    cx, cy = x + w//2, y + h//2
+    x0, y0 = max(0, cx - side//2), max(0, cy - side//2)
+    x1 = min(img_bgr.shape[1], x0 + side)
+    y1 = min(img_bgr.shape[0], y0 + side)
+    roi = img_bgr[y0:y1, x0:x1]
+    return roi if roi.size else center_crop_to_square(img_bgr)
+
+def pick_roi(img_bgr):
+    if ROI_MODE == "skin":
+        return roi_skin(img_bgr)
+    if ROI_MODE == "edges":
+        return roi_edges(img_bgr)
+    return center_crop_to_square(img_bgr)
+
+# --------------- Preprocess ----------------
+def preprocess(frame_bgr):
+    """
+    Returns (pre_rgb_64x64, pre_vis_bgr_64x64)
+      - pre_rgb_64x64: EXACT tensor (RGB uint8) we send to FPGA
+      - pre_vis_bgr:   for displaying in OpenCV (colors look right)
+    """
+    roi = pick_roi(frame_bgr)                   # crop
+    img = cv2.resize(roi, (IMG_W, IMG_H))
+
+    if PREPROCESS_MODE == "rgb":
+        pre_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pre_vis = img                           # display in BGR
+    elif PREPROCESS_MODE == "bgr":
+        pre_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # CNN wants RGB
+        pre_vis = img
+    elif PREPROCESS_MODE == "gray3":
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        pre_vis = cv2.merge([g,g,g])            # BGR display
+        pre_rgb = cv2.cvtColor(pre_vis, cv2.COLOR_BGR2RGB)
+    elif PREPROCESS_MODE == "clahe3":
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(2.0, (8,8))
+        g = clahe.apply(g)
+        pre_vis = cv2.merge([g,g,g])
+        pre_rgb = cv2.cvtColor(pre_vis, cv2.COLOR_BGR2RGB)
+    else:
+        pre_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pre_vis = img
+
+    return pre_rgb.astype(np.uint8), pre_vis.astype(np.uint8)
+
+def bg_guard(pre_rgb):
+    gray = cv2.cvtColor(cv2.cvtColor(pre_rgb, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY)
+    m, s = float(np.mean(gray)), float(np.std(gray))
+    return (m < BG_MEAN_THR) or (s < BG_STD_THR), m, s
+
+# --------------- Inference (chunked DMA) ---------------
+def _infer_once(pre_rgb, timeout_s=2.0):
+    # Flatten HWC bytes; pack into u32 LSB
+    flat = pre_rgb.reshape(-1).astype(np.uint8)       # RGB order as trained
+    in_words[:] = flat.astype(np.uint32)
+
+    # Arm S2MM and start IP
+    dma.recvchannel.transfer(out_words)
+    cnn.write(0x10, NUM_PIX)      # img_words (words)
+    cnn.write(0x00, 1)            # ap_start
+
+    # Send MM2S in chunks
+    sent = 0
+    while sent < NUM_PIX:
+        n = min(WORDS_PER_CHUNK, NUM_PIX - sent)
+        sub = in_words[sent:sent+n]
+        dma.sendchannel.transfer(sub)
+        dma.sendchannel.wait()
+        sent += n
+
+    # Wait S2MM idle
+    t0 = time.time()
+    while not dma.recvchannel.idle:
+        if time.time() - t0 > timeout_s:
+            raise TimeoutError("S2MM timeout")
+        time.sleep(0.001)
+
+    # Read logits (int8 in LSB)
+    raw_i8 = (out_words & 0xFF).astype(np.uint8).view(np.int8)
+    logits = raw_i8.astype(np.float32)
+    ex = np.exp(logits - np.max(logits))
+    probs = ex / np.sum(ex)
+    pred_model_idx = int(np.argmax(probs))
+    return logits, probs, pred_model_idx
+
+def infer_with_guards(frame_bgr):
+    global last_pre_rgb
+    pre_rgb, pre_vis_bgr = preprocess(frame_bgr)
+    last_pre_rgb = pre_rgb.copy()
+
+    bg, mean_v, std_v = bg_guard(pre_rgb)
+    meta = {"mean":mean_v, "std":std_v}
+
+    if bg:
+        return None, None, GESTURE_LABELS.index("unknown"), pre_vis_bgr, meta, pre_rgb
+
+    try:
+        logits, probs, pred_model = _infer_once(pre_rgb)
+    except Exception as e:
+        print("[WARN] Inference error, resetting DMA:", e)
+        reset_dma_hard()
+        logits, probs, pred_model = _infer_once(pre_rgb)
+
+    # remap model-index -> display index
+    mapped_idx = INDEX_MAP[pred_model]
+
+    # confidence threshold to unknown
+    if float(np.max(probs)) < CONF_THRESH:
+        mapped_idx = GESTURE_LABELS.index("unknown")
+
+    return logits, probs, mapped_idx, pre_vis_bgr, meta, pre_rgb
+
+# --------------- Drawing helpers ----------------
+def draw_probs_panel(probs, W=320, H=240):
+    panel = np.zeros((H, W, 3), dtype=np.uint8)
+    if probs is None:
+        cv2.putText(panel, "UNKNOWN/BG", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
+        return panel
+
+    # reorder probs so bars line up with display labels
+    disp = np.zeros_like(probs)
+    for j, i in enumerate(INDEX_MAP):
+        disp[i] = probs[j]
+    left, top, height = 10, 24, 28
+    maxw = W - 140
+    for i, name in enumerate(GESTURE_LABELS):
+        p = float(disp[i])
+        w = int(max(1, p * maxw))
+        y = top + i * (height + 8)
+        cv2.rectangle(panel, (left, y), (left + w, y + height), (255,255,255), -1)
+        cv2.putText(panel, f"{name:>8} {p*100:5.1f}%", (left + w + 6, y + height - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+    return panel
+
+def scale_nearest(img, W=320, H=240): return cv2.resize(img, (W,H), interpolation=cv2.INTER_NEAREST)
+def annotate(frame, text): 
+    cv2.putText(frame, text, (10, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3); 
+    return frame
+
+# --------------- Flask app ----------------
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    links = ('<a href="/set_mode/gray3">gray3</a> | '
+             '<a href="/set_mode/clahe3">clahe3</a> | '
+             '<a href="/set_mode/rgb">rgb</a> | '
+             '<a href="/set_mode/bgr">bgr</a> | '
+             '<a href="/set_roi/center">center</a> | '
+             '<a href="/set_roi/skin">skin</a> | '
+             '<a href="/set_roi/edges">edges</a> | '
+             '<a href="/save_64x64">save_64x64</a>')
+    return f'''
+    <html>
+    <head><title>FPGA Live Gesture Debug Dashboard</title></head>
+    <body style="background:#111;color:#eee;font-family:monospace">
+      <h2>FPGA Live Gesture Debug Dashboard</h2>
+      <div>Mode: <b>{PREPROCESS_MODE}</b> &nbsp; ROI: <b>{ROI_MODE}</b> &nbsp;|
+        Switch: {links}
+        <br/>Remap: GET /set_map/CSV (model→display), e.g. /set_map/0,1,2,3,4,5
+      </div>
+      <hr/>
+      <img src="/video_debug" width="640" height="480" />
+      <p>Top-Left: Raw center-crop &nbsp; | &nbsp; Top-Right: Preprocessed (x5) &nbsp; | &nbsp; Bottom-Left: Annotated Output &nbsp; | &nbsp; Bottom-Right: Probabilities</p>
+    </body></html>'''
+
+@app.route('/set_mode/<mode>')
+def set_mode(mode):
+    global PREPROCESS_MODE
+    if mode in ["gray3","clahe3","rgb","bgr"]:
+        PREPROCESS_MODE = mode
+        print(f"[INFO] PREPROCESS_MODE -> {mode}")
+    return redirect('/')
+
+@app.route('/set_roi/<roi>')
+def set_roi(roi):
+    global ROI_MODE
+    if roi in ["center","skin","edges"]:
+        ROI_MODE = roi
+        print(f"[INFO] ROI_MODE -> {roi}")
+    return redirect('/')
+
+@app.route('/set_map/<csv>')
+def set_map(csv):
+    global INDEX_MAP
+    try:
+        vals = [int(x) for x in csv.split(',')]
+        assert len(vals) == len(GESTURE_LABELS)
+        assert sorted(vals) == list(range(len(GESTURE_LABELS)))
+        INDEX_MAP = vals
+        print("[INFO] INDEX_MAP ->", INDEX_MAP)
+    except Exception as e:
+        print("[WARN] bad /set_map:", csv, e)
+    return redirect('/')
+
+@app.route('/save_64x64')
+def save_64x64():
+    if last_pre_rgb is None:
+        return redirect('/')
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    npy = os.path.join(SNAP_DIR, f"pre_rgb_{PREPROCESS_MODE}_{ROI_MODE}_{ts}.npy")
+    png = os.path.join(SNAP_DIR, f"pre_rgb_{PREPROCESS_MODE}_{ROI_MODE}_{ts}.png")
+    np.save(npy, last_pre_rgb)                                 # RGB uint8
+    bgr = cv2.cvtColor(last_pre_rgb, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(png, bgr)
+    print(f"[INFO] Saved {npy} and {png}")
+    return redirect('/')
+
+@app.route('/video_debug')
+def video_debug():
+    def gen():
+        fid = 0
+        last_info = "Starting..."
+        while True:
+            ok, frame = camera.read()
+            if not ok:
+                time.sleep(0.01); continue
+
+            raw_crop = center_crop_to_square(frame)
+            raw_panel = scale_nearest(cv2.resize(raw_crop, (320,240)), 320,240)
+
+            if fid % 2 == 0:
+                try:
+                    logits, probs, pred_disp_idx, pre_vis_bgr, meta, pre_rgb = infer_with_guards(frame)
+                    label = GESTURE_LABELS[pred_disp_idx].upper()
+                    conf  = "-" if probs is None else f"{float(np.max(probs))*100:.1f}%"
+                    last_info = f"{label} ({conf}) | mode={PREPROCESS_MODE} | roi={ROI_MODE} | mean={meta['mean']:.1f}, std={meta['std']:.1f}"
+                    pre_panel  = scale_nearest(pre_vis_bgr, 320, 240)         # what the CNN saw (displayed BGR)
+                    out_panel  = scale_nearest(frame, 320, 240)
+                    out_panel  = annotate(out_panel, f"{label} {conf}")
+                    probs_panel= draw_probs_panel(probs, 320, 240)
+                except Exception as e:
+                    last_info = f"WAITING... ({e})"
+                    pre_panel  = np.zeros((240,320,3), np.uint8)
+                    out_panel  = scale_nearest(frame, 320, 240)
+                    probs_panel= draw_probs_panel(None, 320, 240)
+
+            top = np.hstack([raw_panel, pre_panel])
+            bot = np.hstack([out_panel, probs_panel])
+            grid = np.vstack([top, bot])
+
+            # header
+            cv2.rectangle(grid, (0,0), (640,24), (32,32,32), -1)
+            cv2.putText(grid, last_info, (6,18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+            ok, buf = cv2.imencode('.jpg', grid, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            if not ok: continue
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+            fid += 1
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    print("[INFO] Starting Flask app...")
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
+    app.run(host='0.0.0.0', port=5000, threaded=True)
