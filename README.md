@@ -26,9 +26,9 @@ This project implements a real-time hand gesture recognition system using CNN an
 3. Feed into trained CNN model
 4. Output predicted gesture
 
-## Results
+## FPGA Board
 
-![Output](pynq.jpg)
+![PynqZ2](Pynq.jpg)
 
 ## Future Improvements
 
