@@ -1,36 +1,85 @@
-# FPGA-Based Real-Time Hand Gesture Recognition
+# 🚀 Hardware-Efficient Hand Gesture Recognition on FPGA (HGR-Lite)
 
-## Overview
+## 📌 Overview
 
-This project implements a real-time hand gesture recognition system using CNN and OpenCV, designed for FPGA deployment using PYNQ-Z2.
+This project implements a real-time hand gesture recognition system on FPGA using a custom lightweight CNN.
 
-## Features
+It covers the full pipeline:
 
-* Real-time hand gesture detection using webcam
-* CNN-based classification model
-* Segmentation-assisted recognition
-* Designed for edge AI deployment
+* Model training (TensorFlow)
+* Quantization (INT8)
+* FPGA acceleration (Vitis HLS)
+* Real-time inference (PYNQ + DMA)
 
-## Tech Stack
+---
 
-* Python
-* OpenCV
-* TensorFlow / Keras
-* PYNQ-Z2
-* Xilinx Vivado
+## 🧠 Key Features
 
-## How it works
+* Depthwise CNN (MobileNet-style)
+* INT8 quantized inference
+* Custom FPGA accelerator (no prebuilt IP)
+* AXI Stream + DMA pipeline
+* Real-time webcam input
+* Debug dashboard (Flask)
 
-1. Capture hand using webcam
-2. Process image using OpenCV
-3. Feed into trained CNN model
-4. Output predicted gesture
+---
 
-## FPGA Board
+## 🏗️ System Pipeline
 
-![PynqZ2](Pynq.jpg)
+Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 
-## Future Improvements
+---
 
-* Full FPGA acceleration
-* More gesture classes
+## 🧩 Model Details
+
+* Input: 64×64 RGB
+* 4 Depthwise Conv Blocks
+* BatchNorm + ReLU
+* Fully Connected Layers
+* Output: 6 gesture classes
+
+---
+
+## ⚙️ Hardware Implementation
+
+* Vitis HLS (C++)
+* BRAM for feature maps
+* ROM for weights
+* INT8 fixed-point arithmetic
+
+---
+
+## 🔁 Deployment Flow
+
+1. Train model in TensorFlow
+2. Quantize weights to INT8
+3. Export weights to C headers
+4. Load into FPGA using HLS
+5. Run inference using DMA on PYNQ
+
+---
+
+## 🎥 Features
+
+* Live gesture detection
+* ROI selection (center / skin / edges)
+* Confidence filtering
+* Debug visualization dashboard
+
+---
+
+## 🛠️ Tech Stack
+
+* Python, TensorFlow, OpenCV
+* Vitis HLS
+* PYNQ (Zynq FPGA)
+* Flask
+
+---
+
+## 🚧 Future Improvements
+
+* Better accuracy
+* Faster inference (pipelining)
+* Full hardware softmax
+* IoT integration
