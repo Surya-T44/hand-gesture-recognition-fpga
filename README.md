@@ -47,6 +47,7 @@ Camera → Preprocessing → DMA → FPGA CNN → DMA → CPU → Output
 * ROM for weights
 * INT8 fixed-point arithmetic
 
+![Board](assets/pynq.jpg)
 ---
 
 ## Deployment Flow
